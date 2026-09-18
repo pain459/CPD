@@ -53,6 +53,23 @@ body {
 .brand-text strong { font-size: 1.35rem; letter-spacing: 0.06em; }
 .brand-text small { color: var(--muted); font-size: 0.75rem; }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
+
+.topbar-clocks {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 0.82rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: var(--text);
+}
+.clock-item { display: inline-flex; align-items: center; gap: 5px; }
+.clock-label { color: var(--muted); font-weight: 600; font-size: 0.75rem; }
+.clock-sep { color: var(--muted); opacity: 0.6; }
+
 .health { font-size: 0.85rem; color: var(--muted); }
 .health.ok::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--good); margin-right: 6px; }
 .health.bad::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--bad); margin-right: 6px; }
@@ -136,4 +153,6 @@ footer { text-align: center; margin-top: 12px; }
 @media (max-width: 900px) {
   .hero, .grid { grid-template-columns: 1fr; }
   .kpis { grid-template-columns: repeat(2, 1fr); }
+  .topbar { flex-wrap: wrap; gap: 12px; }
+  .topbar-clocks { order: 3; width: 100%; justify-content: center; }
 }

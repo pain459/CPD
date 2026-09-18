@@ -28,8 +28,37 @@ function Logo() {
         <path d="M10 29V15h9M34 15v14h-9" stroke="#fff" strokeWidth="3.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
         <circle cx="22" cy="22" r="2.6" fill="#fff" />
       </svg>
-      <span className="brand-text"><strong>CPD</strong><small>Client Data Portal</small></span>
+      <span className="brand-text"><strong>CPD</strong><small>File Drop Portal</small></span>
     </span>
+  );
+}
+
+
+function WorldClocks() {
+  const [time, setTime] = useState(() => new Date());
+
+  useEffect(() => {
+    const timer = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const formatTime = (timeZone) =>
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(time);
+
+  return (
+    <div className="topbar-clocks">
+      <span className="clock-item"><span className="clock-label">ET</span> {formatTime("America/New_York")}</span>
+      <span className="clock-sep">·</span>
+      <span className="clock-item"><span className="clock-label">UTC</span> {formatTime("UTC")}</span>
+      <span className="clock-sep">·</span>
+      <span className="clock-item"><span className="clock-label">IST</span> {formatTime("Asia/Kolkata")}</span>
+    </div>
   );
 }
 
@@ -328,6 +357,7 @@ export default function App() {
     <div className="page">
       <header className="topbar">
         <Logo />
+        <WorldClocks />
         <div className="topbar-right">
           <span className={`health ${healthy ? 'ok' : 'bad'}`} title={health ? JSON.stringify(health.checks) : 'loading'}>
             {healthy ? 'All systems operational' : 'Checking systems…'}
