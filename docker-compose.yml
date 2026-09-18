@@ -133,6 +133,33 @@ services:
     networks:
       - cpd_net
 
+  # Queue-driven autoscaler: grows worker containers with load, shrinks when idle.
+  # Local-dev only: manages siblings via the Docker socket. No host ports.
+  scaler:
+    build:
+      context: .
+      dockerfile: scaler/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cpd}:${POSTGRES_PASSWORD:-cpd_dev_password}@postgres:5432/${POSTGRES_DB:-cpd}
+      REDIS_URL: redis://redis:6379/0
+      MIN_WORKERS: ${MIN_WORKERS:-1}
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+      SCALER_POLL_SECONDS: ${SCALER_POLL_SECONDS:-3}
+      SCALE_DOWN_COOLDOWN_SECONDS: ${SCALE_DOWN_COOLDOWN_SECONDS:-30}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    stop_grace_period: 30s
+    restart: unless-stopped
+    networks:
+      - cpd_net
+
 volumes:
   cpd_pgdata:
   cpd_uploads:

@@ -187,14 +187,156 @@ function JobDetail({ job, onClose }) {
   );
 }
 
+/* ---------- resumable uploader (survives page refresh) ---------- */
+const LS_SESSIONS = 'cpd-upload-sessions';
+const LS_SELECTED = 'cpd-selected-job';
+
+async function sha256Hex(file) {
+  const buf = await file.arrayBuffer();
+  const h = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function loadSessions() {
+  try { return JSON.parse(localStorage.getItem(LS_SESSIONS) || '[]'); } catch { return []; }
+}
+function rememberSession(s) {
+  const all = loadSessions().filter((x) => x.upload_id !== s.upload_id);
+  all.push(s);
+  localStorage.setItem(LS_SESSIONS, JSON.stringify(all));
+}
+function forgetSession(id) {
+  localStorage.setItem(LS_SESSIONS, JSON.stringify(loadSessions().filter((x) => x.upload_id !== id)));
+}
+
+function Uploader({ onJob }) {
+  const [pending, setPending] = useState([]);
+  const [active, setActive] = useState(null); // {filename, done, total}
+  const [note, setNote] = useState('');
+  const [resumeFor, setResumeFor] = useState(null);
+  let filePicker = null;
+
+  const refreshPending = useCallback(async () => {
+    const open = [];
+    for (const s of loadSessions()) {
+      try {
+        const st = await fetch(`/api/uploads/resumable/${s.upload_id}`).then((x) => (x.ok ? x.json() : null));
+        if (st && st.status === 'open') open.push({ ...s, received: st.received, total_chunks: st.total_chunks });
+        else forgetSession(s.upload_id);
+      } catch { open.push(s); }
+    }
+    setPending(open);
+  }, []);
+
+  useEffect(() => { refreshPending(); }, [refreshPending]);
+
+  async function runSession(file, session) {
+    const st = await fetch(`/api/uploads/resumable/${session.upload_id}`).then((x) => {
+      if (!x.ok) throw new Error('session lost on server — start a new upload');
+      return x.json();
+    });
+    const have = new Set(st.received || []);
+    for (let i = 0; i < st.total_chunks; i++) {
+      if (have.has(i)) continue;
+      const blob = file.slice(i * st.chunk_size, (i + 1) * st.chunk_size);
+      const res = await fetch(`/api/uploads/resumable/${session.upload_id}/chunks/${i}`, { method: 'PUT', body: blob });
+      if (!res.ok) throw new Error(`chunk ${i} rejected: ${await res.text()}`);
+      setActive({ upload_id: session.upload_id, filename: file.name, done: i + 1, total: st.total_chunks });
+    }
+    const done = await fetch(`/api/uploads/resumable/${session.upload_id}/complete`, { method: 'POST' }).then((x) => {
+      if (!x.ok) throw new Error(`complete failed: ${x.status}`);
+      return x.json();
+    });
+    forgetSession(session.upload_id);
+    setPending((p) => p.filter((x) => x.upload_id !== session.upload_id));
+    return done;
+  }
+
+  async function ingest(file) {
+    setNote('Hashing file…');
+    const sha = await sha256Hex(file);
+    setNote('Opening upload session…');
+    const init = await fetch('/api/uploads/resumable/init', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, size: file.size, sha256: sha }),
+    }).then((x) => {
+      if (!x.ok) throw new Error(`init failed: ${x.status}`);
+      return x.json();
+    });
+    rememberSession({ upload_id: init.upload_id, filename: file.name, size: file.size });
+    setActive({ upload_id: init.upload_id, filename: file.name, done: init.received.length, total: init.total_chunks });
+    try {
+      const done = await runSession(file, init);
+      setActive(null);
+      setNote(`Queued ${file.name} as job ${done.job_id.slice(0, 8)}…${done.deduped ? ' (already processed — deduplicated)' : ''}`);
+      onJob && onJob(done);
+    } catch (e) {
+      setNote(`Upload paused — safe to refresh, then Resume. (${e.message})`);
+      refreshPending();
+    }
+  }
+
+  async function onPick(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (resumeFor && (file.name !== resumeFor.filename || file.size !== resumeFor.size)) {
+      setNote(`That file doesn't match "${resumeFor.filename}" — pick the same file to resume.`);
+      return;
+    }
+    setResumeFor(null);
+    await ingest(file).catch((e) => setNote(`Upload failed: ${e.message}`));
+  }
+
+  async function cancel(s) {
+    await fetch(`/api/uploads/resumable/${s.upload_id}`, { method: 'DELETE' }).catch(() => {});
+    forgetSession(s.upload_id);
+    setPending((p) => p.filter((x) => x.upload_id !== s.upload_id));
+  }
+
+  return (
+    <div className="upload">
+      <input type="file" accept=".csv,.xlsx,.json" aria-label="Data file"
+        ref={(n) => { filePicker = n; }} onChange={onPick} style={{ display: 'none' }} />
+      <div className="row-between">
+        <button className="btn primary" onClick={() => filePicker && filePicker.click()}>Select file &amp; ingest</button>
+        <span className="muted">CSV · JSON · Excel — chunked, resumable</span>
+      </div>
+      {active && <p><progress value={active.done} max={active.total} /> {active.done}/{active.total} chunks — {active.filename}</p>}
+      {pending.filter((s) => !active || s.upload_id !== active.upload_id).map((s) => (
+        <p key={s.upload_id} className="pending">
+          Paused upload: <strong>{s.filename}</strong>
+          {s.received && <> ({s.received.length}/{s.total_chunks} chunks kept)</>}
+          {' '}<button className="btn" onClick={() => { setResumeFor(s); filePicker && filePicker.click(); }}>Resume</button>
+          {' '}<button className="btn ghost" onClick={() => cancel(s)}>Discard</button>
+        </p>
+      ))}
+      {note && <p className="muted">{note}</p>}
+    </div>
+  );
+}
+
 /* ---------- app ---------- */
 export default function App() {
   const [theme, toggleTheme] = useTheme();
   const [jobs, setJobs] = useState([]);
   const [health, setHealth] = useState(null);
   const [summary, setSummary] = useState(null);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelectedState] = useState(() => {
+    try {
+      const id = localStorage.getItem(LS_SELECTED);
+      return id ? { id } : null;
+    } catch { return null; }
+  });
   const [msg, setMsg] = useState('');
+
+  function setSelected(j) {
+    setSelectedState(j);
+    try {
+      if (j) localStorage.setItem(LS_SELECTED, j.id);
+      else localStorage.removeItem(LS_SELECTED);
+    } catch { /* private mode */ }
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -217,17 +359,9 @@ export default function App() {
     return () => clearInterval(t);
   }, [refresh]);
 
-  async function onUpload(e) {
-    e.preventDefault();
-    const f = new FormData(e.target).get('file');
-    if (!f || !f.name) return;
-    const fd = new FormData();
-    fd.append('file', f);
-    setMsg('Uploading…');
-    const res = await fetch('/api/uploads', { method: 'POST', body: fd });
-    const body = await res.json();
-    setMsg(res.ok ? `Queued ${f.name} as job ${body.job_id.slice(0, 8)}…${body.deduped ? ' (already processed — deduplicated)' : ''}` : `Upload failed: ${JSON.stringify(body)}`);
-    e.target.reset();
+  const scaler = health?.autoscaler;
+
+  async function onJob() {
     refresh();
   }
 
@@ -252,6 +386,7 @@ export default function App() {
           <span className={`health ${healthy ? 'ok' : 'bad'}`} title={health ? JSON.stringify(health.checks) : 'loading'}>
             {healthy ? 'All systems operational' : 'Checking systems…'}
           </span>
+          {scaler && <span className="muted">{scaler.actual} worker{scaler.actual === 1 ? '' : 's'} · queue {scaler.queue}</span>}
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
       </header>
@@ -264,13 +399,11 @@ export default function App() {
             normalizes currencies to USD, loads clean data into the warehouse, and quarantines
             problematic rows with machine-readable reasons. Raw files are archived to S3 object
             storage, and every job can be tracked live below — from upload to loaded.
+            Uploads are chunked and resumable: refresh at any point and pick up where you left off.
           </p>
         </div>
-        <form className="upload" onSubmit={onUpload}>
-          <input type="file" name="file" accept=".csv,.xlsx,.json" aria-label="Data file" />
-          <button className="btn primary" type="submit">Upload &amp; ingest</button>
-          {msg && <p className="muted">{msg}</p>}
-        </form>
+        <Uploader onJob={onJob} />
+        {msg && <p className="muted">{msg}</p>}
       </section>
 
       <section className="kpis">
@@ -316,7 +449,7 @@ export default function App() {
 
       {selected && <JobDetail job={selected} onClose={() => setSelected(null)} />}
 
-      <footer className="muted">CPD Data Platform · uploads are deduplicated, archived to S3, and never double-counted.</footer>
+      <footer className="muted">CPD Data Platform · uploads are resumable, deduplicated, archived to S3, and never double-counted.</footer>
     </div>
   );
 }

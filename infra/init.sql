@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS rejected_rows (
 );
 CREATE INDEX IF NOT EXISTS idx_rejected_job ON rejected_rows(job_id);
 
+-- Resumable upload sessions: chunked browser uploads that survive refresh.
+-- The assembled file lands in UPLOAD_DIR; completion registers an etl_job.
+CREATE TABLE IF NOT EXISTS upload_sessions (
+  id UUID PRIMARY KEY,
+  filename TEXT NOT NULL,
+  size BIGINT NOT NULL,
+  chunk_size INT NOT NULL,
+  total_chunks INT NOT NULL,
+  sha256 TEXT NOT NULL DEFAULT '',
+  received JSONB NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'open',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status);
+
 INSERT INTO products (sku, product_name, category) VALUES
   ('SKU-1', 'Apple', 'Produce'),
   ('SKU-2', 'Bread', 'Bakery'),

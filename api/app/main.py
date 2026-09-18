@@ -12,7 +12,7 @@ from pathlib import Path
 
 import psycopg
 import redis
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 import s3util
@@ -24,6 +24,10 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/uploads"))
 QUEUE_KEY = "cpd:queue"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "infra" / "init.sql"
+STAGING_DIR = UPLOAD_DIR / ".staging"
+DEFAULT_CHUNK_SIZE = 1024 * 1024
+MIN_CHUNK_SIZE = 8 * 1024
+MAX_CHUNK_SIZE = 8 * 1024 * 1024
 
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -46,6 +50,18 @@ async def lifespan(app: FastAPI):
         s3util.ensure_bucket(s3util.client(), s["bucket"])
     except Exception as e:  # S3 (RustFS) may lag behind api on first boot
         print(f"warn: S3 bucket ensure failed, uploads will retry per-request: {e}", flush=True)
+    try:
+        # Drop staging state for sessions abandoned >24h ago (refresh-proof, not leak-proof).
+        with pg() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM upload_sessions WHERE status='open'"
+                        " AND updated_at < now() - interval '24 hours'")
+            for (sid,) in cur.fetchall():
+                (STAGING_DIR / f"{sid}.part").unlink(missing_ok=True)
+            cur.execute("UPDATE upload_sessions SET status='abandoned' WHERE status='open'"
+                        " AND updated_at < now() - interval '24 hours'")
+            conn.commit()
+    except Exception as e:
+        print(f"warn: stale upload cleanup failed: {e}", flush=True)
     yield
 
 
@@ -99,51 +115,184 @@ def health():
     except Exception as e:
         checks["s3"] = f"error: {e}"
     status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
-    return {"status": status, "checks": checks}
+    body = {"status": status, "checks": checks}
+    try:
+        state = r.get("cpd:scaler")
+        body["autoscaler"] = json.loads(state) if state else None
+    except Exception:
+        body["autoscaler"] = None
+    return body
 
 
-@app.post("/api/uploads")
-def upload(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx", ".json")):
-        raise HTTPException(400, "Only .csv / .xlsx / .json accepted")
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    job_id = str(uuid.uuid4())
-    dest = UPLOAD_DIR / f"{job_id}_{Path(file.filename).name}"
-    sha = hashlib.sha256()
-    size = 0
-    with dest.open("wb") as f:
-        while chunk := file.file.read(1024 * 1024):
-            sha.update(chunk)
-            size += len(chunk)
-            f.write(chunk)
-    digest = sha.hexdigest()
+def _register_job(dest: Path, filename: str, size: int, digest: str) -> dict:
+    """Shared finish path: dedupe -> S3 archive -> job row -> enqueue.
+
+    Returns {"job_id", "deduped"}. Consumes dest (deleted on dedupe/Failure).
+    """
     with pg() as conn, conn.cursor() as cur:
-        # Idempotency: same file content returns existing job (before any S3 write)
         cur.execute("SELECT id FROM etl_jobs WHERE file_sha256=%s ORDER BY created_at DESC LIMIT 1", (digest,))
         row = cur.fetchone()
         conn.commit()
         if row:
             dest.unlink(missing_ok=True)
             return {"job_id": str(row[0]), "deduped": True}
-    # Archive to the S3 raw lake BEFORE registering the job: no S3 copy, no job.
+    job_id = str(uuid.uuid4())
+    final = UPLOAD_DIR / f"{job_id}_{Path(filename).name}"
+    if dest != final:
+        dest.rename(final)
     s = s3util.settings()
-    key = s3util.key_for(job_id, file.filename)
+    key = s3util.key_for(job_id, filename)
     try:
         cli = s3util.client()
         s3util.ensure_bucket(cli, s["bucket"])
-        s3util.put_file(cli, s["bucket"], key, dest)
+        s3util.put_file(cli, s["bucket"], key, final)
     except Exception as e:
-        dest.unlink(missing_ok=True)
+        final.unlink(missing_ok=True)
         raise HTTPException(502, f"S3 raw-lake write failed: {e}")
     with pg() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO etl_jobs (id, filename, file_sha256, file_size, status, s3_key)"
             " VALUES (%s,%s,%s,%s,'QUEUED',%s)",
-            (job_id, file.filename, digest, size, key),
+            (job_id, filename, digest, size, key),
         )
         conn.commit()
     r.rpush(QUEUE_KEY, job_id)
     return {"job_id": job_id, "deduped": False}
+
+
+@app.post("/api/uploads")
+def upload(file: UploadFile = File(...)):
+    """Single-shot upload (curl-friendly). Browser UI uses resumable sessions."""
+    if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx", ".json")):
+        raise HTTPException(400, "Only .csv / .xlsx / .json accepted")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = UPLOAD_DIR / f"tmp_{uuid.uuid4().hex}"
+    sha = hashlib.sha256()
+    size = 0
+    with tmp.open("wb") as f:
+        while chunk := file.file.read(1024 * 1024):
+            sha.update(chunk)
+            size += len(chunk)
+            f.write(chunk)
+    return _register_job(tmp, file.filename, size, sha.hexdigest())
+
+
+# ---------------- resumable uploads (survive browser refresh) ----------------
+
+def _session_or_404(cur, upload_id: str):
+    cur.execute("SELECT id, filename, size, chunk_size, total_chunks, sha256, received, status"
+                " FROM upload_sessions WHERE id=%s", (upload_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "upload session not found")
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row))
+
+
+@app.post("/api/uploads/resumable/init")
+def resumable_init(payload: dict):
+    filename = (payload.get("filename") or "").strip()
+    size = int(payload.get("size") or 0)
+    sha256 = (payload.get("sha256") or "").strip().lower()
+    chunk_size = int(payload.get("chunk_size") or DEFAULT_CHUNK_SIZE)
+    if not filename or not filename.lower().endswith((".csv", ".xlsx", ".json")):
+        raise HTTPException(400, "Only .csv / .xlsx / .json accepted")
+    if size <= 0:
+        raise HTTPException(400, "size must be positive")
+    chunk_size = max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, chunk_size))
+    total_chunks = (size + chunk_size - 1) // chunk_size
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    with pg() as conn, conn.cursor() as cur:
+        # Resume an identical open session instead of starting over.
+        cur.execute("SELECT id FROM upload_sessions WHERE filename=%s AND size=%s"
+                    " AND sha256=%s AND status='open' ORDER BY updated_at DESC LIMIT 1",
+                    (filename, size, sha256))
+        row = cur.fetchone()
+        if row:
+            conn.commit()
+            sess = _session_or_404(cur, str(row[0]))
+            sess["received"] = sess["received"] or []
+            return {"upload_id": sess["id"], "resumed": True, **{k: sess[k] for k in ("total_chunks", "chunk_size", "received")}}
+        upload_id = str(uuid.uuid4())
+        (STAGING_DIR / f"{upload_id}.part").touch()
+        cur.execute(
+            "INSERT INTO upload_sessions (id, filename, size, chunk_size, total_chunks, sha256)"
+            " VALUES (%s,%s,%s,%s,%s,%s)",
+            (upload_id, filename, size, chunk_size, total_chunks, sha256),
+        )
+        conn.commit()
+    return {"upload_id": upload_id, "resumed": False, "total_chunks": total_chunks,
+            "chunk_size": chunk_size, "received": []}
+
+
+@app.put("/api/uploads/resumable/{upload_id}/chunks/{index}")
+async def resumable_chunk(upload_id: str, index: int, request: Request):
+    body = await request.body()
+    with pg() as conn, conn.cursor() as cur:
+        sess = _session_or_404(cur, upload_id)
+        if sess["status"] != "open":
+            raise HTTPException(409, f"session is {sess['status']}")
+        if not 0 <= index < sess["total_chunks"]:
+            raise HTTPException(400, "chunk index out of range")
+        if len(body) > sess["chunk_size"]:
+            raise HTTPException(400, "chunk bigger than session chunk_size")
+        part = STAGING_DIR / f"{upload_id}.part"
+        with part.open("r+b") as f:
+            f.seek(index * sess["chunk_size"])
+            f.write(body)
+        received = set(sess["received"] or []) | {index}
+        cur.execute("UPDATE upload_sessions SET received=%s::jsonb, updated_at=now() WHERE id=%s",
+                    (json.dumps(sorted(received)), upload_id))
+        conn.commit()
+    return {"upload_id": upload_id, "index": index, "received_count": len(received),
+            "total_chunks": sess["total_chunks"]}
+
+
+@app.get("/api/uploads/resumable/{upload_id}")
+def resumable_status(upload_id: str):
+    with pg() as conn, conn.cursor() as cur:
+        sess = _session_or_404(cur, upload_id)
+        conn.commit()
+    sess["received"] = sess["received"] or []
+    return sess
+
+
+@app.post("/api/uploads/resumable/{upload_id}/complete")
+def resumable_complete(upload_id: str):
+    with pg() as conn, conn.cursor() as cur:
+        sess = _session_or_404(cur, upload_id)
+        if sess["status"] != "open":
+            raise HTTPException(409, f"session is {sess['status']}")
+        missing = set(range(sess["total_chunks"])) - set(sess["received"] or [])
+        if missing:
+            raise HTTPException(400, f"missing chunks: {sorted(missing)[:10]}")
+        part = STAGING_DIR / f"{upload_id}.part"
+        if not part.exists() or part.stat().st_size < sess["size"]:
+            raise HTTPException(400, "assembled file smaller than declared size")
+        # Authoritative server-side hash (client sha is only a resume hint).
+        sha = hashlib.sha256()
+        with part.open("rb") as f:
+            while chunk := f.read(1024 * 1024):
+                sha.update(chunk)
+        digest = sha.hexdigest()
+        cur.execute("UPDATE upload_sessions SET status='complete', updated_at=now() WHERE id=%s",
+                    (upload_id,))
+        conn.commit()
+    try:
+        return _register_job(part, sess["filename"], sess["size"], digest)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+@app.delete("/api/uploads/resumable/{upload_id}")
+def resumable_abandon(upload_id: str):
+    with pg() as conn, conn.cursor() as cur:
+        sess = _session_or_404(cur, upload_id)
+        cur.execute("UPDATE upload_sessions SET status='abandoned', updated_at=now() WHERE id=%s",
+                    (upload_id,))
+        conn.commit()
+    (STAGING_DIR / f"{upload_id}.part").unlink(missing_ok=True)
+    return {"upload_id": upload_id, "status": "abandoned", "filename": sess["filename"]}
 
 
 @app.get("/api/jobs")

@@ -22,5 +22,8 @@ scale-worker:
 	docker compose up -d --scale worker=$(N) --no-recreate
 	docker compose ps worker
 
+workers:
+	docker ps --filter label=cpd.autoscaled=true --format "{{.Names}} (autoscaled)" ; docker compose ps worker
+
 clean:
-	docker compose down -v
+	docker rm -f $$(docker ps -aq --filter label=cpd.autoscaled=true) 2>/dev/null; docker compose down -v
