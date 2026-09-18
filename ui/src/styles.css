@@ -1,0 +1,6 @@
+body { font-family: system-ui, sans-serif; margin: 2rem; }
+table { border-collapse: collapse; margin-top: 1rem; }
+td, th { border: 1px solid #ccc; padding: 6px 10px; }
+.pill { padding: 2px 8px; border-radius: 10px; background: #eee; }
+.pill.COMPLETED { background: #c8f5c8; }
+.pill.FAILED { background: #f5c8c8; }

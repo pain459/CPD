@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CPD: on-demand large scale fixtures (10k is committed, 100k+ generated locally)
+samples/*100k*.csv
+samples/*1m*.csv

@@ -1,0 +1,141 @@
+name: cpd
+
+# Port map (host -> container), all on 127.0.0.1:
+#   8180 -> ui:80            (portal; avoids flow 8080)
+#   8181 -> api:8000         (direct API debug; avoids flow 8080/8081)
+#   5433 -> postgres:5432    (avoids default 5432)
+#   6380 -> redis:6379       (avoids default 6379)
+#   9190 -> s3:9000 (S3 API; avoids flow 9000 which is archived MinIO)
+#   9191 -> s3:9001 (S3 console; avoids flow 9001)
+# flow also uses 9200/5601 — CPD uses neither.
+# NOTE: MinIO community server is archived (read-only since Apr 2026,
+# last tag Oct 2025, source-only, no community binaries). CPD uses RustFS
+# (Apache-2.0, MinIO-compatible S3 API + console, same 9000/9001 ports).
+# Rejected: Garage (AGPL-3.0, same license trap as MinIO), SeaweedFS
+# (mature but multi-component; fallback if RustFS RC becomes an issue).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cpd}
+      POSTGRES_USER: ${POSTGRES_USER:-cpd}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cpd_dev_password}
+    volumes:
+      - cpd_pgdata:/var/lib/postgresql/data
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${CPD_BIND_ADDRESS:-127.0.0.1}:${CPD_POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cpd} -d ${POSTGRES_DB:-cpd}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - cpd_net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${CPD_BIND_ADDRESS:-127.0.0.1}:${CPD_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - cpd_net
+
+  s3:
+    image: rustfs/rustfs:latest
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-cpdadmin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-cpd_s3_dev_password_change_me}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - cpd_s3_data:/data
+    ports:
+      - "${CPD_BIND_ADDRESS:-127.0.0.1}:${CPD_S3_API_PORT:-9190}:9000"
+      - "${CPD_BIND_ADDRESS:-127.0.0.1}:${CPD_S3_CONSOLE_PORT:-9191}:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - cpd_net
+
+  api:
+    build:
+      context: ./api
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cpd}:${POSTGRES_PASSWORD:-cpd_dev_password}@postgres:5432/${POSTGRES_DB:-cpd}
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /uploads
+      S3_ENDPOINT: http://s3:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-cpdadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-cpd_s3_dev_password_change_me}
+      S3_BUCKET: ${S3_BUCKET:-cpd-raw}
+    volumes:
+      - cpd_uploads:/uploads
+    ports:
+      - "${CPD_BIND_ADDRESS:-127.0.0.1}:${CPD_API_PORT:-8181}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - cpd_net
+
+  worker:
+    build:
+      context: ./worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cpd}:${POSTGRES_PASSWORD:-cpd_dev_password}@postgres:5432/${POSTGRES_DB:-cpd}
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /uploads
+      S3_ENDPOINT: http://s3:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-cpdadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-cpd_s3_dev_password_change_me}
+      S3_BUCKET: ${S3_BUCKET:-cpd-raw}
+    volumes:
+      - cpd_uploads:/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    networks:
+      - cpd_net
+
+  ui:
+    build:
+      context: ./ui
+    ports:
+      - "${CPD_BIND_ADDRESS:-127.0.0.1}:${CPD_UI_PORT:-8180}:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - cpd_net
+
+volumes:
+  cpd_pgdata:
+  cpd_uploads:
+  cpd_s3_data:
+
+networks:
+  cpd_net:
+    driver: bridge
