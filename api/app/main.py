@@ -28,6 +28,8 @@ STAGING_DIR = UPLOAD_DIR / ".staging"
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 MIN_CHUNK_SIZE = 8 * 1024
 MAX_CHUNK_SIZE = 8 * 1024 * 1024
+# Explicit upload cap (bytes). Enforced while streaming, before any job exists.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
 
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -162,17 +164,24 @@ def _register_job(dest: Path, filename: str, size: int, digest: str) -> dict:
 
 @app.post("/api/uploads")
 def upload(file: UploadFile = File(...)):
-    """Single-shot upload (curl-friendly). Browser UI uses resumable sessions."""
+    """Single-shot upload (UI primary path): stream straight into server staging,
+    register the job the moment bytes land. From the 200 response on, refresh is
+    harmless — bytes, job row, and progress all live server-side.
+    (Chunked /api/uploads/resumable/* remains for API-driven huge files.)"""
     if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx", ".json")):
         raise HTTPException(400, "Only .csv / .xlsx / .json accepted")
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = UPLOAD_DIR / f"tmp_{uuid.uuid4().hex}"
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STAGING_DIR / f"tmp_{uuid.uuid4().hex}"
     sha = hashlib.sha256()
     size = 0
     with tmp.open("wb") as f:
         while chunk := file.file.read(1024 * 1024):
             sha.update(chunk)
             size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                f.close()
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
             f.write(chunk)
     return _register_job(tmp, file.filename, size, sha.hexdigest())
 
@@ -199,6 +208,8 @@ def resumable_init(payload: dict):
         raise HTTPException(400, "Only .csv / .xlsx / .json accepted")
     if size <= 0:
         raise HTTPException(400, "size must be positive")
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
     chunk_size = max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, chunk_size))
     total_chunks = (size + chunk_size - 1) // chunk_size
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
