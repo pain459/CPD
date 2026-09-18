@@ -2,7 +2,7 @@ order_id,order_date,store_id,sku,product_name,category,qty,unit_price,currency,c
 O-3001,2024-02-29,S-01,SKU-1,Apple,Produce,1,1.50,USD,C-01,card
 O-3002,2026-09-01,S-01,SKU-2,Bread,Bakery,1,0.00,USD,C-02,cash
 O-3003,2026-09-01,S-02,SKU-3,Milk,Dairy,1,2.205,EUR,C-03,card
-O-3004,2026-09-01,S-03,SKU-5,Café au lait,Beverages,1,4.50,USD,C-04,card
+O-3004,2026-09-01,S-03,SKU-5,Coffee,Beverages,1,4.50,USD,C-04-café,card
 O-3005,2026-09-01,S-01,SKU-1,Apple,Produce,2147483647,1.50,USD,C-05,card
 O-3006,2026-09-01,S-02,SKU-4,Eggs,Dairy,1,0.35,USD,C-06,Cash
 O-3007,2026-09-01,S-01,SKU-1,APPLE,Produce,1,1.50,USD,C-07,card
@@ -11,3 +11,4 @@ O-3009,2026-09-01, S-01 , SKU-1 , Apple , Produce , 1 , 1.50 , USD , C-09 , card
 O-3010,2026-09-01,S-02,SKU-3,Milk,Dairy,2,2.20,GBP,C-10,card
 O-3011,2026-09-01,S-03,SKU-4,Eggs,Dairy,1,0.333333,USD,C-11,cash
 O-3012,2026-09-30,S-01,SKU-5,Coffee,Beverages,1,8.99,USD,C-12,card
+O-3013,2026-09-30,S-01,SKU-1,Banana,Produce,1,1.50,USD,C-13,card

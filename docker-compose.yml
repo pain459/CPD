@@ -74,7 +74,8 @@ services:
 
   api:
     build:
-      context: ./api
+      context: .
+      dockerfile: api/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cpd}:${POSTGRES_PASSWORD:-cpd_dev_password}@postgres:5432/${POSTGRES_DB:-cpd}
       REDIS_URL: redis://redis:6379/0
@@ -98,7 +99,8 @@ services:
 
   worker:
     build:
-      context: ./worker
+      context: .
+      dockerfile: worker/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cpd}:${POSTGRES_PASSWORD:-cpd_dev_password}@postgres:5432/${POSTGRES_DB:-cpd}
       REDIS_URL: redis://redis:6379/0

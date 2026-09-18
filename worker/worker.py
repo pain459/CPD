@@ -1,27 +1,25 @@
-"""CPD Worker Phase 1: pop job ids from Redis, simulate staged ETL progress.
+"""CPD Worker Phase 2: real Retail ETL — parse -> validate -> transform -> load.
 
-Phase 2 will replace the sleep loop with real parse/validate/transform/load
-for the Retail sales CSV, writing to products/orders tables and quarantine.
+Stages update etl_jobs progress so the single UI shows live status.
+Final status: COMPLETED | COMPLETED_WITH_ERRORS | FAILED.
 """
 import os
-import time
+import traceback
 from pathlib import Path
 
 import psycopg
 import redis
+
+from etl import db as etldb
+from etl import parse as etlparse
+from etl import transform as etltransform
+from etl import validate as etlvalidate
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://cpd:cpd_dev_password@postgres:5432/cpd")
 PG_DSN = DATABASE_URL.replace("postgresql+psycopg://", "postgresql://")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/uploads"))
 QUEUE_KEY = "cpd:queue"
-
-STAGES = [
-    ("PARSING", 15),
-    ("VALIDATING", 40),
-    ("TRANSFORMING", 65),
-    ("LOADING", 90),
-]
 
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -36,23 +34,47 @@ def update(job_id, status, pct, rows_total=0, rows_ok=0, rows_rejected=0, err=""
         conn.commit()
 
 
-def count_rows(job_id: str) -> int:
-    for p in UPLOAD_DIR.glob(f"{job_id}_*"):
-        try:
-            with p.open("r", errors="ignore") as f:
-                return max(0, sum(1 for _ in f) - 1)  # minus header
-        except OSError:
-            return 0
-    return 0
+def find_upload(job_id: str) -> Path:
+    matches = list(UPLOAD_DIR.glob(f"{job_id}_*"))
+    if not matches:
+        raise FileNotFoundError(f"no upload found for job {job_id}")
+    return matches[0]
 
 
 def process(job_id: str):
-    total = count_rows(job_id)
-    for status, pct in STAGES:
-        update(job_id, status, pct, rows_total=total)
-        time.sleep(2)  # stand-in for real work
-    # Phase 1: pretend all rows pass
-    update(job_id, "COMPLETED", 100, rows_total=total, rows_ok=total)
+    path = find_upload(job_id)
+    with psycopg.connect(PG_DSN) as conn:
+        etldb.ensure_schema(conn)
+        conn.commit()
+
+    update(job_id, "PARSING", 10)
+    records = etlparse.read_any(path)
+    total = len(records)
+    if total == 0:
+        update(job_id, "FAILED", 100, err="empty file: no data rows")
+        return
+
+    update(job_id, "VALIDATING", 35, rows_total=total)
+    clean, rejected = etlvalidate.validate(records)
+
+    update(job_id, "TRANSFORMING", 60, rows_total=total)
+    enriched = [etltransform.enrich(row) for row in clean]
+
+    update(job_id, "LOADING", 85, rows_total=total)
+    with psycopg.connect(PG_DSN) as conn:
+        etldb.ensure_schema(conn)
+        ok, n_rej = etldb.load_job(conn, job_id, enriched, rejected)
+        conn.commit()
+
+    summary = etldb.error_summary(rejected)
+    if ok == 0:
+        update(job_id, "FAILED", 100, rows_total=total, rows_ok=0,
+               rows_rejected=n_rej, err=summary or "all rows rejected")
+    elif n_rej:
+        update(job_id, "COMPLETED_WITH_ERRORS", 100, rows_total=total,
+               rows_ok=ok, rows_rejected=n_rej, err=summary)
+    else:
+        update(job_id, "COMPLETED", 100, rows_total=total, rows_ok=ok)
 
 
 def main():
@@ -67,7 +89,7 @@ def main():
             process(job_id)
             print(f"done {job_id}", flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"failed {job_id}: {e}", flush=True)
+            print(f"failed {job_id}: {e}\n{traceback.format_exc()}", flush=True)
             try:
                 update(job_id, "FAILED", 100, err=str(e)[:500])
             except Exception:

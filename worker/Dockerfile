@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt .
+COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY worker.py .
+COPY worker/worker.py .
+COPY worker/etl ./etl
+COPY infra/init.sql ./infra/init.sql
 CMD ["python", "worker.py"]
