@@ -1,13 +1,13 @@
 # CPD Sample Datasets — Retail Sales
 
 Deterministic fixtures for upload → ETL → status testing.
-Machine-readable expectations live in `manifest.json` (assert these in Phase-2 tests).
+Machine-readable expectations live in `manifest.json` (assert these in ETL tests).
 
 ## Schema
 
 `order_id,order_date,store_id,sku,product_name,category,qty,unit_price,currency,customer_id,payment_method`
 
-Reference catalog (Phase-2 joins validate against this):
+Reference catalog (ETL joins validate against this):
 
 * SKUs: `SKU-1 Apple/Produce`, `SKU-2 Bread/Bakery`, `SKU-3 Milk/Dairy`, `SKU-4 Eggs/Dairy`, `SKU-5 Coffee/Beverages`
 * Stores: `S-01`, `S-02`, `S-03`

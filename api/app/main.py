@@ -1,4 +1,4 @@
-"""CPD API Phase 3: uploads (volume + S3 raw lake), job tracking, SSE progress,
+"""CPD API: uploads (volume + S3 raw lake), job tracking, SSE progress,
 quarantine downloads, sales reads."""
 import asyncio
 import csv
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="CPD ETL API (Phase 3)", lifespan=lifespan)
+app = FastAPI(title="CPD ETL API", lifespan=lifespan)
 
 JOB_COLS = ("id, filename, file_size, status, progress_pct, rows_total, rows_ok,"
             " rows_rejected, error_summary, s3_key, created_at, updated_at")

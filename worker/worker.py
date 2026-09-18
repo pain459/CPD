@@ -1,4 +1,4 @@
-"""CPD Worker Phase 2: real Retail ETL — parse -> validate -> transform -> load.
+"""CPD Worker: Retail ETL — parse -> validate -> transform -> load.
 
 Stages update etl_jobs progress so the single UI shows live status.
 Final status: COMPLETED | COMPLETED_WITH_ERRORS | FAILED.
