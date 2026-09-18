@@ -10,6 +10,7 @@ from pathlib import Path
 import psycopg
 import redis
 
+import s3util
 from etl import db as etldb
 from etl import parse as etlparse
 from etl import transform as etltransform
@@ -35,10 +36,21 @@ def update(job_id, status, pct, rows_total=0, rows_ok=0, rows_rejected=0, err=""
 
 
 def find_upload(job_id: str) -> Path:
+    """Volume first (fast local path); S3 raw lake fallback (survives volume loss)."""
     matches = list(UPLOAD_DIR.glob(f"{job_id}_*"))
-    if not matches:
-        raise FileNotFoundError(f"no upload found for job {job_id}")
-    return matches[0]
+    if matches:
+        return matches[0]
+    with psycopg.connect(PG_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT filename, s3_key FROM etl_jobs WHERE id=%s", (job_id,))
+        row = cur.fetchone()
+    if not row or not row[1]:
+        raise FileNotFoundError(f"no upload found for job {job_id} (volume miss, no S3 key)")
+    filename, key = row
+    dest = UPLOAD_DIR / f"{job_id}_{Path(filename).name}"
+    s = s3util.settings()
+    s3util.download_file(s3util.client(), s["bucket"], key, dest)
+    print(f"recovered {job_id} from S3 {key}", flush=True)
+    return dest
 
 
 def process(job_id: str):

@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.0
 psycopg[binary]==3.2.1
 redis==5.0.8
 python-multipart==0.0.19
+boto3==1.35.*

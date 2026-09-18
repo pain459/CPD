@@ -13,9 +13,29 @@ function Bar({ value, max, label }) {
 function JobDetail({ job, onClose }) {
   const [detail, setDetail] = useState(null);
   const [rows, setRows] = useState([]);
+  const [live, setLive] = useState(true);
   useEffect(() => {
-    fetch(`/api/jobs/${job.id}`).then((x) => x.json()).then(setDetail);
-    fetch(`/api/jobs/${job.id}/rows?limit=20`).then((x) => x.json()).then(setRows).catch(() => setRows([]));
+    let es;
+    const fetchFallback = () => {
+      fetch(`/api/jobs/${job.id}`).then((x) => x.json()).then((d) => { setDetail(d); setLive(false); });
+    };
+    try {
+      es = new EventSource(`/api/jobs/${job.id}/events`);
+      es.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if (d.error) { es.close(); fetchFallback(); return; }
+        setDetail(d);
+        if (['COMPLETED', 'COMPLETED_WITH_ERRORS', 'FAILED'].includes(d.status)) {
+          es.close();
+          setLive(false);
+          fetch(`/api/jobs/${job.id}/rows?limit=20`).then((x) => x.json()).then(setRows).catch(() => setRows([]));
+        }
+      };
+      es.onerror = () => { es.close(); fetchFallback(); };
+    } catch {
+      fetchFallback();
+    }
+    return () => es && es.close();
   }, [job.id]);
   if (!detail) return <section><p>loading…</p></section>;
   const breakdown = Object.entries(detail.error_breakdown || {});
@@ -23,7 +43,8 @@ function JobDetail({ job, onClose }) {
   return (
     <section className="detail">
       <h2>{detail.filename} <button onClick={onClose}>close</button></h2>
-      <p>Status: <span className={`pill ${detail.status}`}>{detail.status}</span> — {detail.rows_total} total / {detail.rows_ok} ok / {detail.rows_rejected} rejected</p>
+      <p>Status: <span className={`pill ${detail.status}`}>{detail.status}</span>{live && ' (live)'} — {detail.rows_total} total / {detail.rows_ok} ok / {detail.rows_rejected} rejected</p>
+      <p><progress value={detail.progress_pct} max="100" /> {detail.progress_pct}% · <a href={`/api/jobs/${job.id}/raw`}>download raw file</a></p>
       {detail.error_summary && <p className="muted">{detail.error_summary}</p>}
       {breakdown.length > 0 && (
         <>
@@ -98,7 +119,7 @@ export default function App() {
 
   return (
     <main>
-      <h1>CPD ETL Portal — Retail Sales (Phase 2)</h1>
+      <h1>CPD ETL Portal — Retail Sales (Phase 3)</h1>
       <p>Health: {health ? JSON.stringify(health) : '…'}</p>
       <form onSubmit={onUpload}>
         <input type="file" name="file" accept=".csv,.xlsx,.json" />

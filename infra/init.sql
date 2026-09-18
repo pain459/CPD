@@ -1,4 +1,4 @@
--- CPD schema (Phase 2): job tracker + retail sales model + quarantine.
+-- CPD schema (Phase 3): job tracker + retail sales model + quarantine + S3 raw lake.
 -- Idempotent: safe to re-run against existing DBs (worker/API also run it on startup).
 CREATE TABLE IF NOT EXISTS etl_jobs (
   id UUID PRIMARY KEY,
@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS etl_jobs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Phase 3: S3 object key of the archived raw file (empty for pre-Phase-3 jobs).
+ALTER TABLE etl_jobs ADD COLUMN IF NOT EXISTS s3_key TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_etl_jobs_status ON etl_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_etl_jobs_created ON etl_jobs(created_at DESC);
 

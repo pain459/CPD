@@ -1,7 +1,10 @@
-"""CPD API Phase 2: uploads, job tracking, quarantine downloads, sales reads."""
+"""CPD API Phase 3: uploads (volume + S3 raw lake), job tracking, SSE progress,
+quarantine downloads, sales reads."""
+import asyncio
 import csv
 import hashlib
 import io
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -11,6 +14,8 @@ import psycopg
 import redis
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+
+import s3util
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://cpd:cpd_dev_password@postgres:5432/cpd")
 # psycopg (sync) wants plain DSN, not SQLAlchemy prefix
@@ -35,14 +40,21 @@ def ensure_schema():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_schema()  # upgrades pre-Phase-2 volumes; fresh DBs also get init.sql
+    ensure_schema()  # upgrades older volumes; fresh DBs also get init.sql
+    try:
+        s = s3util.settings()
+        s3util.ensure_bucket(s3util.client(), s["bucket"])
+    except Exception as e:  # S3 (RustFS) may lag behind api on first boot
+        print(f"warn: S3 bucket ensure failed, uploads will retry per-request: {e}", flush=True)
     yield
 
 
-app = FastAPI(title="CPD ETL API (Phase 2)", lifespan=lifespan)
+app = FastAPI(title="CPD ETL API (Phase 3)", lifespan=lifespan)
 
 JOB_COLS = ("id, filename, file_size, status, progress_pct, rows_total, rows_ok,"
-            " rows_rejected, error_summary, created_at, updated_at")
+            " rows_rejected, error_summary, s3_key, created_at, updated_at")
+
+TERMINAL = {"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"}
 
 
 def _filters(alias: str, date_from, date_to, store_id):
@@ -80,6 +92,12 @@ def health():
         checks["redis"] = "ok"
     except Exception as e:
         checks["redis"] = f"error: {e}"
+    try:
+        s = s3util.settings()
+        s3util.client().head_bucket(Bucket=s["bucket"])
+        checks["s3"] = "ok"
+    except Exception as e:
+        checks["s3"] = f"error: {e}"
     status = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
     return {"status": status, "checks": checks}
 
@@ -100,16 +118,28 @@ def upload(file: UploadFile = File(...)):
             f.write(chunk)
     digest = sha.hexdigest()
     with pg() as conn, conn.cursor() as cur:
-        # Idempotency: same file content returns existing job
+        # Idempotency: same file content returns existing job (before any S3 write)
         cur.execute("SELECT id FROM etl_jobs WHERE file_sha256=%s ORDER BY created_at DESC LIMIT 1", (digest,))
         row = cur.fetchone()
+        conn.commit()
         if row:
-            conn.commit()
             dest.unlink(missing_ok=True)
             return {"job_id": str(row[0]), "deduped": True}
+    # Archive to the S3 raw lake BEFORE registering the job: no S3 copy, no job.
+    s = s3util.settings()
+    key = s3util.key_for(job_id, file.filename)
+    try:
+        cli = s3util.client()
+        s3util.ensure_bucket(cli, s["bucket"])
+        s3util.put_file(cli, s["bucket"], key, dest)
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(502, f"S3 raw-lake write failed: {e}")
+    with pg() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO etl_jobs (id, filename, file_sha256, file_size, status) VALUES (%s,%s,%s,%s,'QUEUED')",
-            (job_id, file.filename, digest, size),
+            "INSERT INTO etl_jobs (id, filename, file_sha256, file_size, status, s3_key)"
+            " VALUES (%s,%s,%s,%s,'QUEUED',%s)",
+            (job_id, file.filename, digest, size, key),
         )
         conn.commit()
     r.rpush(QUEUE_KEY, job_id)
@@ -167,6 +197,60 @@ def job_rows(job_id: str, limit: int = 50):
                     (job_id, min(limit, 500)))
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+@app.get("/api/jobs/{job_id}/raw")
+def job_raw(job_id: str):
+    """Download the archived raw file: local volume first, S3 lake fallback."""
+    with pg() as conn, conn.cursor() as cur:
+        cur.execute("SELECT filename, s3_key FROM etl_jobs WHERE id=%s", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "job not found")
+        filename, s3_key = row
+    for cand in UPLOAD_DIR.glob(f"{job_id}_*"):
+        return StreamingResponse(cand.open("rb"), media_type="application/octet-stream",
+                                 headers={"Content-Disposition": f"attachment; filename={filename}"})
+    if not s3_key:
+        raise HTTPException(404, "raw file not found (pre-S3 job, volume miss)")
+    try:
+        s = s3util.settings()
+        data = s3util.get_bytes(s3util.client(), s["bucket"], s3_key)
+    except Exception as e:
+        raise HTTPException(502, f"S3 raw-lake read failed: {e}")
+    return StreamingResponse(iter([data]), media_type="application/octet-stream",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+def _job_payload(job_id: str) -> dict | None:
+    with pg() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {JOB_COLS} FROM etl_jobs WHERE id=%s", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        body = dict(zip(cols, row))
+        body["error_breakdown"] = error_breakdown(conn, job_id)
+        return body
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def job_events(job_id: str):
+    """SSE stream of job progress; closes after the terminal state is sent."""
+
+    async def gen():
+        while True:
+            payload = await asyncio.to_thread(_job_payload, job_id)
+            if payload is None:
+                yield f"data: {json.dumps({'error': 'job not found'})}\n\n"
+                return
+            yield f"data: {json.dumps(payload, default=str)}\n\n"
+            if payload["status"] in TERMINAL:
+                return
+            await asyncio.sleep(1)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/sales/summary")
